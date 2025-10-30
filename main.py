@@ -13,6 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 from uuid import UUID
+import jwt  # PyJWT
 
 # --- Parks & Access ---
 from parks_routes import router as parks_router
@@ -236,8 +237,9 @@ class OpcUaClient:
 # ---------------------------------------------------------------------
 # AUTH HELPERS
 # ---------------------------------------------------------------------
-# --- AUTH HELPERS (main.py) ---
-jwt_strategy = get_jwt_strategy()
+SECRET = os.getenv("SECRET_KEY") or "change-me"
+JWT_ALG = "HS256"
+JWT_AUD = "fastapi-users:auth"
 
 async def get_user_by_id(user_id: str) -> Optional[DBUser]:
     try:
@@ -248,20 +250,22 @@ async def get_user_by_id(user_id: str) -> Optional[DBUser]:
         res = await session.execute(select(DBUser).where(DBUser.id == uuid_id))
         return res.scalar_one_or_none()
 
-async def user_from_token(token: str) -> Optional[DBUser]:
-    """Validate JWT and return the user, or None if invalid."""
+def _decode_jwt(token: str) -> Optional[dict]:
     try:
-        # ✅ IMPORTANT: get a real UserManager instance (NOT Depends / NOT None)
-        async for manager in get_user_manager():
-            payload = await jwt_strategy.read_token(token, manager)
-            user_id = payload.get("sub")
-            if not user_id:
-                logging.error("JWT missing 'sub'")
-                return None
-            return await get_user_by_id(user_id)
+        # FastAPI-Users tokens include aud=["fastapi-users:auth"]
+        return jwt.decode(token, SECRET, algorithms=[JWT_ALG], audience=JWT_AUD)
     except Exception as e:
         logging.error(f"JWT decode failed: {e}")
         return None
+
+async def user_from_token(token: str) -> Optional[DBUser]:
+    payload = _decode_jwt(token)
+    if not payload:
+        return None
+    sub = payload.get("sub")
+    if not sub:
+        return None
+    return await get_user_by_id(sub)
 
 # ---------------------------------------------------------------------
 # TELEMETRY SHAPE HELPERS (canonical shape for REST + WS)
