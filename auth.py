@@ -26,7 +26,10 @@ from schemas_user import UserRead, UserCreate, UserUpdate
 # -----------------------------------------------------------------------------
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
-SECRET = os.getenv("SECRET_KEY") or "change-me"
+SECRET = os.getenv("SECRET_KEY")
+if not SECRET:
+    raise RuntimeError("Missing SECRET_KEY in environment (.env)")
+
 
 # SMTP settings (optional welcome email)
 SMTP_HOST = os.getenv("SMTP_HOST", "")
@@ -43,8 +46,8 @@ WELCOME_EMAIL_ENABLED = os.getenv("WELCOME_EMAIL_ENABLED", "true").lower() in {"
 bearer_transport = BearerTransport(tokenUrl="/auth/jwt/login")
 
 def get_jwt_strategy() -> JWTStrategy:
-    # 30-minute access tokens; adjust as needed
-    return JWTStrategy(secret=SECRET, lifetime_seconds=30 * 60)
+    lifetime_minutes = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+    return JWTStrategy(secret=SECRET, lifetime_seconds=lifetime_minutes * 60)
 
 auth_backend = AuthenticationBackend(
     name="jwt-bearer",

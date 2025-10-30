@@ -82,13 +82,20 @@ logging.getLogger("opcua").setLevel(logging.WARNING)
 
 app = FastAPI(title="SCADA Web API", version="1.0")
 
-# ✅ CORS from .env
+# ✅ CORS from .env (fallbacks include Vite/CRA common ports)
 _origins_env = os.getenv("CORS_ALLOW_ORIGINS", "")
 origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins or ["http://127.0.0.1:3000", "http://localhost:3000", "http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:8080", "http://localhost:8080"],
+    allow_origins=origins or [
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -227,6 +234,52 @@ class OpcUaClient:
         return data
 
 # ---------------------------------------------------------------------
+# AUTH HELPERS
+# ---------------------------------------------------------------------
+# --- AUTH HELPERS (main.py) ---
+jwt_strategy = get_jwt_strategy()
+
+async def get_user_by_id(user_id: str) -> Optional[DBUser]:
+    try:
+        uuid_id = UUID(user_id)
+    except Exception:
+        return None
+    async for session in get_async_session():
+        res = await session.execute(select(DBUser).where(DBUser.id == uuid_id))
+        return res.scalar_one_or_none()
+
+async def user_from_token(token: str) -> Optional[DBUser]:
+    """Validate JWT and return the user, or None if invalid."""
+    try:
+        # ✅ IMPORTANT: get a real UserManager instance (NOT Depends / NOT None)
+        async for manager in get_user_manager():
+            payload = await jwt_strategy.read_token(token, manager)
+            user_id = payload.get("sub")
+            if not user_id:
+                logging.error("JWT missing 'sub'")
+                return None
+            return await get_user_by_id(user_id)
+    except Exception as e:
+        logging.error(f"JWT decode failed: {e}")
+        return None
+
+# ---------------------------------------------------------------------
+# TELEMETRY SHAPE HELPERS (canonical shape for REST + WS)
+# ---------------------------------------------------------------------
+def _dict_client_to_view(d: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = d.get("nodes") or {}
+    nodes_list = [{"name": k, "value": str(v)} for k, v in nodes.items()]
+    return {
+        "name": d.get("name") or "",
+        "url": d.get("url") or "",
+        "status": d.get("status") or "DISCONNECTED",
+        "nodes": nodes_list,
+    }
+
+def _payload_from_raw_list(raw_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"plc_clients": [_dict_client_to_view(d) for d in raw_list]}
+
+# ---------------------------------------------------------------------
 # THREADING & BROADCAST LOOP
 # ---------------------------------------------------------------------
 stop_event = threading.Event()
@@ -248,22 +301,19 @@ def data_broadcast_loop(loop: asyncio.AbstractEventLoop):
             if reconnect_list:
                 list(executor.map(lambda p: p.connect_and_discover(), reconnect_list))
 
-            # read all data
+            # read all data once per tick
             all_plc_data = list(executor.map(lambda p: p.read_data(), plc_clients))
 
-            # ✅ Broadcast filtered data to each websocket (wrapped for the UI)
+            # ✅ Broadcast filtered data to each websocket in one canonical shape
             for user_id, sockets in list(active_ws_connections.items()):
-                for ws in sockets:
+                for ws in list(sockets):
                     try:
                         allowed = getattr(ws, "allowed_urls", None)
-                        visible_data = (
-                            [d for d in all_plc_data if d["url"] in allowed]
+                        visible = (
+                            [d for d in all_plc_data if (d.get("url") in allowed)]
                             if allowed else all_plc_data
                         )
-                        payload = {
-                            "type": "telemetry_update",
-                            "data": {"plc_clients": visible_data},
-                        }
+                        payload = {"type": "telemetry_update", "data": _payload_from_raw_list(visible)}
                         asyncio.run_coroutine_threadsafe(ws.send_json(payload), loop)
                     except Exception as e:
                         logging.error(f"WebSocket send error for {user_id}: {e}")
@@ -273,6 +323,7 @@ def data_broadcast_loop(loop: asyncio.AbstractEventLoop):
                 if stop_event.is_set():
                     break
                 time.sleep(1)
+
         except Exception as e:
             logging.error(f"Broadcast error: {e}")
             time.sleep(5)
@@ -301,28 +352,6 @@ async def on_shutdown():
         except Exception:
             pass
     logging.info("Shutdown complete.")
-
-# ---------------------------------------------------------------------
-# JWT HELPERS
-# ---------------------------------------------------------------------
-jwt_strategy = get_jwt_strategy()
-
-async def get_user_by_id(user_id: str) -> Optional[DBUser]:
-    # Explicitly cast string to UUID (Postgres-safe)
-    try:
-        uuid_id = UUID(user_id)
-    except Exception:
-        return None
-    async for session in get_async_session():
-        res = await session.execute(select(DBUser).where(DBUser.id == uuid_id))
-        return res.scalar_one_or_none()
-
-async def user_from_token(token: str) -> Optional[DBUser]:
-    try:
-        payload = await jwt_strategy.read_token(token, None)
-        return await get_user_by_id(payload.get("sub"))
-    except Exception:
-        return None
 
 # ---------------------------------------------------------------------
 # ROUTES
@@ -399,71 +428,56 @@ async def write_plc_value(req: WriteRequest, user: DBUser = Depends(current_user
         raise HTTPException(500, f"Write failed: {e}")
 
 # ---------------------------------------------------------------------
-# DATA ACCESS CONTROL
+# DATA (REST) — same canonical shape as WS
 # ---------------------------------------------------------------------
 @app.get("/data")
 async def get_initial_data(
     user: DBUser = Depends(current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
-    """
-    Return initial telemetry in the same shape the frontend expects:
-    { "plc_clients": [...] }
-    """
-    if not plc_clients:
-        return {"plc_clients": []}
-
     if user.is_superuser:
-        allowed = {cfg["url"] for cfg in PLC_CONFIG}
+        allowed_urls = {cfg["url"] for cfg in PLC_CONFIG}
     else:
-        res = await session.execute(select(UserParkAccess.park_id).where(UserParkAccess.user_id == user.id))
+        res = await session.execute(
+            select(UserParkAccess.park_id).where(UserParkAccess.user_id == user.id)
+        )
         park_ids = [r[0] for r in res.all()]
-        allowed = {PARKS[p]["url"] for p in park_ids if p in PARKS}
+        allowed_urls = {PARKS[p]["url"] for p in park_ids if p in PARKS}
 
-    visible_clients = [p for p in plc_clients if p.url in allowed]
-    data_list = list(executor.map(lambda p: p.read_data(), visible_clients))
-    return {"plc_clients": data_list}
+    visible_clients = [p for p in plc_clients if p.url in allowed_urls]
+    # Read fresh values for the visible list
+    raw = list(executor.map(lambda p: p.read_data(), visible_clients))
+    return _payload_from_raw_list(raw)
 
+# ---------------------------------------------------------------------
+# WEBSOCKET — token via query (?token=...) or Sec-WebSocket-Protocol: bearer,<JWT>
+# ---------------------------------------------------------------------
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
-    """
-    Robust WebSocket endpoint:
-    - Accepts token from query (?token=), Sec-WebSocket-Protocol, or Authorization header.
-    - Keeps connection alive and logs detailed reason for closures.
-    """
     proto = websocket.headers.get("Sec-WebSocket-Protocol") or ""
-    auth_header = websocket.headers.get("Authorization")
     token = None
 
-    # Extract token
     try:
         if proto.startswith("bearer,"):
             token = proto.split(",", 1)[1].strip()
             await websocket.accept(subprotocol=proto)
-        elif "token" in websocket.query_params:
-            token = websocket.query_params["token"]
-            await websocket.accept()
-        elif auth_header and auth_header.lower().startswith("bearer "):
-            token = auth_header.split(" ", 1)[1]
-            await websocket.accept()
         else:
+            token = websocket.query_params.get("token")
             await websocket.accept()
     except Exception as e:
         logging.error(f"WS accept error: {e}")
         return
 
     if not token:
-        logging.warning("WS: missing token → closing.")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
     user = await user_from_token(token)
     if not user or not user.is_active:
-        logging.warning("WS: invalid or inactive token → closing.")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    # Allowed URLs for user
+    # determine allowed parks
     async for session in get_async_session():
         if user.is_superuser:
             allowed_urls = {cfg["url"] for cfg in PLC_CONFIG}
@@ -480,20 +494,15 @@ async def ws_endpoint(websocket: WebSocket):
     logging.info(f"✅ WS connected: {user.email}")
 
     try:
+        # Keep open; broadcast loop pushes telemetry
         while True:
-            await asyncio.sleep(30)
-            try:
-                await websocket.send_json({"type": "keepalive"})
-            except Exception as e:
-                logging.warning(f"WS send error ({user.email}): {e}")
-                break
+            await asyncio.sleep(3600)
     except WebSocketDisconnect:
         logging.info(f"⚠️ WS disconnected: {user.email}")
     finally:
-        conns = active_ws_connections.get(user_key)
-        if conns:
-            conns.discard(websocket)
-            if not conns:
+        bucket = active_ws_connections.get(user_key)
+        if bucket:
+            bucket.discard(websocket)
+            if not bucket:
                 active_ws_connections.pop(user_key, None)
         logging.info(f"🔌 WS cleanup complete for {user.email}")
-
